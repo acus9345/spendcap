@@ -1,0 +1,15 @@
+node_modules/
+*.tgz
+# Never commit secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log

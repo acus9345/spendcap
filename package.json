@@ -1,0 +1,62 @@
+{
+  "name": "spendcap",
+  "version": "0.1.0",
+  "description": "Hard spend caps for OpenAI, Anthropic and Gemini clients. Wraps the SDK client, checks an estimate before each call, reads real token usage from each response, and refuses calls once a run, user or daily budget is used up.",
+  "keywords": [
+    "llm",
+    "ai",
+    "budget",
+    "spend",
+    "cost",
+    "limit",
+    "openai",
+    "anthropic",
+    "claude",
+    "gemini",
+    "tokens"
+  ],
+  "homepage": "https://github.com/acus9345/spendcap#readme",
+  "bugs": {
+    "url": "https://github.com/acus9345/spendcap/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/acus9345/spendcap.git"
+  },
+  "license": "MIT",
+  "author": "acus9345 <acus9345@gmail.com>",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "prices": "node scripts/prices.mjs",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "prelint": "npm run build",
+    "lint": "tsc -p tsconfig.json",
+    "pretest": "npm run build",
+    "test": "node --test \"test/*.test.ts\"",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}
