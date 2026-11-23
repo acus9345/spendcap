@@ -4,29 +4,41 @@ function defined(usage) {
 function openaiUsage(usage) {
     if (!usage)
         return undefined;
+    const prompt = usage.prompt_tokens ?? usage.input_tokens;
+    const output = usage.completion_tokens ?? usage.output_tokens;
+    if (prompt === undefined && output === undefined)
+        return undefined;
     const cached = (usage.prompt_tokens_details ?? usage.input_tokens_details)?.cached_tokens ?? 0;
     return {
-        input: (usage.prompt_tokens ?? usage.input_tokens ?? 0) - cached,
-        output: usage.completion_tokens ?? usage.output_tokens ?? 0,
+        input: Math.max(0, (prompt ?? 0) - cached),
+        output: output ?? 0,
         cacheRead: cached,
     };
 }
 function anthropicUsage(usage) {
     if (!usage)
         return undefined;
-    return defined({
+    const out = defined({
         input: usage.input_tokens ?? undefined,
         output: usage.output_tokens ?? undefined,
         cacheRead: usage.cache_read_input_tokens ?? undefined,
         cacheWrite: usage.cache_creation_input_tokens ?? undefined,
     });
+    return Object.keys(out).length > 0 ? out : undefined;
 }
 function geminiUsage(usage) {
     if (!usage)
         return undefined;
+    if (usage.promptTokenCount === undefined &&
+        usage.toolUsePromptTokenCount === undefined &&
+        usage.candidatesTokenCount === undefined &&
+        usage.thoughtsTokenCount === undefined &&
+        usage.cachedContentTokenCount === undefined) {
+        return undefined;
+    }
     const cached = usage.cachedContentTokenCount ?? 0;
     return {
-        input: (usage.promptTokenCount ?? 0) + (usage.toolUsePromptTokenCount ?? 0) - cached,
+        input: Math.max(0, (usage.promptTokenCount ?? 0) + (usage.toolUsePromptTokenCount ?? 0) - cached),
         output: (usage.candidatesTokenCount ?? 0) + (usage.thoughtsTokenCount ?? 0),
         cacheRead: cached,
     };

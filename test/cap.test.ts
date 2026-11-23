@@ -12,6 +12,7 @@ import {
   UnknownModelError,
   type Price,
   type SpendEvent,
+  type Store,
 } from "../dist/index.js";
 
 const PRICE: Price = { input: 10, output: 20, cacheRead: 1, cacheWrite: 15 };
@@ -23,7 +24,17 @@ class FakeOpenAI {
   #key = "secret";
   calls: any[] = [];
   chat = { completions: { create: (params: any) => this.#send(params), parse: (params: any) => this.#send(params), stream: () => "untracked" } };
-  responses = { create: async (params: any) => ({ usage: { input_tokens: 2000, output_tokens: 1000, input_tokens_details: { cached_tokens: 1000 } }, echo: params }) };
+  responses = {
+    create: async (params: any) => {
+      if (params.stream) {
+        return (async function* () {
+          yield { type: "response.output_text.delta", delta: "hi" };
+          yield { type: "response.completed", response: { usage: { input_tokens: 2000, output_tokens: 1000, input_tokens_details: { cached_tokens: 1000 } } } };
+        })();
+      }
+      return { usage: { input_tokens: 2000, output_tokens: 1000, input_tokens_details: { cached_tokens: 1000 } }, echo: params };
+    },
+  };
   models = { list: () => this.key() };
   embeddings = { create: async () => "free pass" };
   key() {
@@ -36,7 +47,8 @@ class FakeOpenAI {
     if (params.stream) {
       return (async function* () {
         yield { choices: [{ delta: { content: "hi" } }] };
-        yield { choices: [], usage: { prompt_tokens: 1000, completion_tokens: 500 } };
+        if (params.streamFail) throw new Error("stream boom");
+        if (!params.noUsage) yield { choices: [], usage: { prompt_tokens: 1000, completion_tokens: 500 } };
       })();
     }
     return { usage: { prompt_tokens: 3000, completion_tokens: 1000, prompt_tokens_details: { cached_tokens: 2000 } } };
@@ -54,6 +66,7 @@ class FakeAnthropic {
       })();
     },
     stream: (params: any) => {
+      if (params.failSync) throw new Error("sync boom");
       const stream: any = new EventEmitter();
       stream.finalMessage = async () => {
         const message = { usage: { input_tokens: 1000, output_tokens: 1000 } };
@@ -102,6 +115,15 @@ describe("reading usage", () => {
     await cap.wrap(fakeGemini, { user: "a" }).models.generateContent({ model: "test", contents: "hi", config: { maxOutputTokens: 10 } });
     near((await cap.spent({ user: "a" })).user, (1000 * 10 + 1000 * 1 + 1000 * 20) / 1e6);
   });
+
+  it("clamps uncached input at zero if cached tokens exceed prompt tokens", async () => {
+    const cap = createSpendCap({ limits: { user: 10 }, pricing });
+    const weird = {
+      chat: { completions: { create: async (_params: any) => ({ usage: { prompt_tokens: 500, completion_tokens: 100, prompt_tokens_details: { cached_tokens: 1000 } } }) } },
+    };
+    await cap.wrap(weird, { user: "a" }).chat.completions.create({ model: "test", messages: [], max_tokens: 10 });
+    near((await cap.spent({ user: "a" })).user, (0 * 10 + 1000 * 1 + 100 * 20) / 1e6);
+  });
 });
 
 describe("streams", () => {
@@ -118,6 +140,13 @@ describe("streams", () => {
     assert.equal(fake.calls[0].stream_options.include_usage, true);
     assert.equal((await drain(stream as any)).length, 2);
     near((await cap.spent({ user: "a" })).user, (1000 * 10 + 500 * 20) / 1e6);
+  });
+
+  it("reads usage from OpenAI Responses streams", async () => {
+    const cap = createSpendCap({ limits: { user: 10 }, pricing });
+    const stream = await cap.wrap(new FakeOpenAI(), { user: "a" }).responses.create({ model: "test", input: "hi", stream: true, max_output_tokens: 10 });
+    assert.equal((await drain(stream as any)).length, 2);
+    near((await cap.spent({ user: "a" })).user, (1000 * 10 + 1000 * 1 + 1000 * 20) / 1e6);
   });
 
   it("merges Anthropic stream events", async () => {
@@ -139,6 +168,30 @@ describe("streams", () => {
     near((await cap.spent({ user: "a" })).user, (1000 * 10 + 1000 * 1 + 1 * 20) / 1e6);
   });
 
+  it("keeps the estimated hold when a stream ends without usage, breaks before usage, or fails mid-stream", async () => {
+    const events: SpendEvent[] = [];
+    const cap = createSpendCap({ limits: { user: 10 }, pricing, onSpend: (event) => events.push(event) });
+    const wrapped = cap.wrap(new FakeOpenAI(), { user: "a" });
+
+    // Stream completes without ever emitting a usage chunk
+    const noUsage = await wrapped.chat.completions.create({ model: "test", messages: [], stream: true, noUsage: true, max_tokens: 1000 });
+    await drain(noUsage as any);
+    assert.equal(events[0]!.estimated, true);
+    assert.ok(events[0]!.cost >= 0.02);
+
+    // Reader breaks before OpenAI's final usage chunk arrives
+    const early = await wrapped.chat.completions.create({ model: "test", messages: [], stream: true, max_tokens: 1000 });
+    for await (const _ of early as any) break;
+    assert.equal(events[1]!.estimated, true);
+    assert.ok(events[1]!.cost >= 0.02);
+
+    // Stream throws after emitting a content chunk without usage
+    const failing = await wrapped.chat.completions.create({ model: "test", messages: [], stream: true, streamFail: true, max_tokens: 1000 });
+    await assert.rejects(drain(failing as any), /stream boom/);
+    assert.equal(events[2]!.estimated, true);
+    assert.ok(events[2]!.cost >= 0.02);
+  });
+
   it("keeps the hold on a stream nobody reads", async () => {
     const cap = createSpendCap({ limits: { user: 10 }, pricing });
     await cap.wrap(new FakeAnthropic(), { user: "a" }).messages.create({ model: "test", messages: [], stream: true, max_tokens: 1000 });
@@ -156,6 +209,28 @@ describe("streams", () => {
     near((await cap.spent({ user: "a" })).user, (1000 * 10 + 1000 * 20) / 1e6);
   });
 
+  it("waits for async store settlement before messages.stream finalMessage resolves", async () => {
+    const inner = memoryStore();
+    const slowStore: Store = {
+      async add(key, delta, ttl) {
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        return inner.add(key, delta, ttl);
+      },
+      get: (key) => inner.get(key),
+    };
+    const cap = createSpendCap({ limits: { user: 10 }, pricing, store: slowStore });
+    const stream: any = cap.wrap(new FakeAnthropic(), { user: "a" }).messages.stream({ model: "test", messages: [], max_tokens: 10_000 });
+    await stream.finalMessage();
+    near((await cap.spent({ user: "a" })).user, (1000 * 10 + 1000 * 20) / 1e6);
+  });
+
+  it("refunds the hold when messages.stream throws synchronously", async () => {
+    const cap = createSpendCap({ limits: { user: 10 }, pricing });
+    const stream: any = cap.wrap(new FakeAnthropic(), { user: "a" }).messages.stream({ model: "test", messages: [], max_tokens: 1000, failSync: true });
+    await assert.rejects(stream.finalMessage(), /sync boom/);
+    near((await cap.spent({ user: "a" })).user, 0);
+  });
+
   it("rejects the helper when the budget is gone", async () => {
     const cap = createSpendCap({ limits: { user: 0.000001 }, pricing });
     const stream: any = cap.wrap(new FakeAnthropic(), { user: "a" }).messages.stream({ model: "test", messages: [], max_tokens: 1000 });
@@ -168,6 +243,14 @@ describe("streams", () => {
 
 describe("the cap", () => {
   const client = (cap: ReturnType<typeof createSpendCap>, scope = {}) => cap.wrap(new FakeOpenAI(), { user: "a", ...scope });
+
+  it("rejects NaN or negative limits and invalid defaultOutputTokens", () => {
+    assert.throws(() => createSpendCap({ limits: { user: Number.NaN } }), RangeError);
+    assert.throws(() => createSpendCap({ limits: { day: -1 } }), RangeError);
+    assert.throws(() => createSpendCap({ limits: { user: 1 }, defaultOutputTokens: -10 }), RangeError);
+    assert.throws(() => createSpendCap({ limits: { user: 1 }, defaultOutputTokens: Number.NaN }), RangeError);
+    assert.throws(() => createSpendCap({ limits: { user: 1 }, defaultOutputTokens: Number.POSITIVE_INFINITY }), RangeError);
+  });
 
   it("refuses one huge request before it is sent", async () => {
     const cap = createSpendCap({ limits: { user: 0.01 }, pricing });
@@ -211,13 +294,18 @@ describe("the cap", () => {
     near((await cap.spent({ user: "a" })).user, 0);
   });
 
-  it("charges the estimate when usage is missing", async () => {
+  it("charges the estimate when usage is missing or empty", async () => {
     const events: SpendEvent[] = [];
     const cap = createSpendCap({ limits: { user: 1 }, pricing, onSpend: (event) => events.push(event) });
     const bare = { messages: { create: async (_params: any) => ({}) } };
     await cap.wrap(bare, { user: "a" }).messages.create({ model: "test", max_tokens: 1000 });
     assert.equal(events[0]!.estimated, true);
     assert.ok((await cap.spent({ user: "a" })).user! >= 0.02);
+
+    const emptyUsage = { chat: { completions: { create: async (_params: any) => ({ usage: {} }) } } };
+    await cap.wrap(emptyUsage, { user: "b" }).chat.completions.create({ model: "test", max_tokens: 1000 });
+    assert.equal(events[1]!.estimated, true);
+    assert.ok((await cap.spent({ user: "b" })).user! >= 0.02);
   });
 
   it("keeps runs apart, and gives each wrap its own run by default", async () => {
@@ -237,6 +325,20 @@ describe("the cap", () => {
     const spent = await cap.spent({ run: "r", user: "a" });
     near(spent.run, 0);
     near(spent.user, 0);
+  });
+
+  it("rolls back earlier limits if the store throws on a later limit", async () => {
+    const inner = memoryStore();
+    const flakyStore: Store = {
+      add(key, delta, ttl) {
+        if (key.startsWith("user:")) throw new Error("store down");
+        return inner.add(key, delta, ttl);
+      },
+      get: (key) => inner.get(key),
+    };
+    const cap = createSpendCap({ limits: { run: 100, user: 100 }, pricing, store: flakyStore });
+    await assert.rejects(client(cap, { run: "r" }).chat.completions.create({ model: "test", messages: [], max_tokens: 1000 }), /store down/);
+    near(await inner.get("run:r"), 0);
   });
 
   it("starts a new day at midnight UTC", async () => {
@@ -259,6 +361,12 @@ describe("the cap", () => {
   it("says which scope a limit needs", () => {
     const cap = createSpendCap({ limits: { user: 1 }, pricing });
     assert.throws(() => cap.wrap(new FakeOpenAI()), /needs a scope with a user/);
+  });
+
+  it("throws a clear TypeError when params or model are missing", async () => {
+    const cap = createSpendCap({ limits: { user: 1 }, pricing });
+    const wrapped: any = client(cap);
+    await assert.rejects(() => wrapped.chat.completions.create(), /needs a model name/);
   });
 
   it("uses a shared store when given one", async () => {
@@ -326,7 +434,15 @@ describe("pricing", () => {
   it("lets custom prices win", () => {
     assert.equal(priceFor("gpt-5", { "gpt-5": PRICE }), PRICE);
     assert.equal(priceFor("my-deployment", () => PRICE), PRICE);
-    assert.equal(priceFor("gpt-5", () => undefined), PRICES["gpt-5"]);
+    const seen: string[] = [];
+    assert.equal(
+      priceFor("gpt-5", (model) => {
+        seen.push(model);
+        return undefined;
+      }),
+      PRICES["gpt-5"],
+    );
+    assert.deepEqual(seen, ["gpt-5"]);
   });
 
   it("switches to the higher rate for big requests", () => {
@@ -361,6 +477,19 @@ describe("estimateTokens", () => {
   it("doesn't count a base64 image by its length", () => {
     assert.equal(estimateTokens(`data:image/png;base64,${"A".repeat(1_000_000)}`), 1500);
     assert.equal(estimateTokens("A".repeat(1_000_000)), 1500);
+  });
+
+  it("handles circular references, shared objects, and binary buffers", () => {
+    const cyclic: Record<string, unknown> = { text: "hello" };
+    cyclic.self = cyclic;
+    assert.ok(estimateTokens(cyclic) > 0);
+
+    const shared = { content: "x".repeat(350) };
+    assert.equal(estimateTokens([shared, shared]), estimateTokens(shared) * 2);
+
+    assert.equal(estimateTokens(new Uint8Array(100_000)), 1500);
+    assert.equal(estimateTokens(new ArrayBuffer(100_000)), 1500);
+    assert.equal(estimateTokens(new Uint8Array(0)), 0);
   });
 });
 

@@ -51,7 +51,7 @@ export function priceFor(model, pricing) {
     const id = model.replace(/^models\//, "");
     const base = id.replace(/[-@](\d{8}|\d{4}-\d{2}-\d{2}|latest)$/, "");
     if (typeof pricing === "function") {
-        const found = pricing(id) ?? pricing(base);
+        const found = pricing(id) ?? (base !== id ? pricing(base) : undefined);
         if (found)
             return found;
     }
@@ -67,6 +67,9 @@ export function costOf(price, usage) {
 }
 /** Rough token count. It leans high, since it's used to stop a call before it's sent. */
 export function estimateTokens(value) {
+    return estimateValue(value, new WeakSet());
+}
+function estimateValue(value, active) {
     if (typeof value === "string") {
         // Base64 and data URLs are images or files, billed nothing like their length.
         if (value.length > 2000 && (value.startsWith("data:") || /^[\w+/=-]+$/.test(value.slice(0, 2000))))
@@ -77,15 +80,33 @@ export function estimateTokens(value) {
             value.charCodeAt(i) < 128 ? ascii++ : other++;
         return Math.ceil(ascii / 3.5 + other);
     }
-    if (Array.isArray(value))
-        return value.reduce((sum, item) => sum + estimateTokens(item), 0);
     if (typeof value === "object" && value !== null) {
-        return Object.entries(value).reduce((sum, [key, item]) => sum + estimateTokens(key) + estimateTokens(item), 0);
+        if (value instanceof ArrayBuffer || ArrayBuffer.isView(value))
+            return value.byteLength > 0 ? 1500 : 0;
+        if (active.has(value))
+            return 0;
+        active.add(value);
+        try {
+            if (Array.isArray(value))
+                return value.reduce((sum, item) => sum + estimateValue(item, active), 0);
+            return Object.entries(value).reduce((sum, [key, item]) => sum + estimateValue(key, active) + estimateValue(item, active), 0);
+        }
+        finally {
+            active.delete(value);
+        }
     }
     return value === undefined || value === null ? 0 : 1;
 }
 export function createSpendCap(options) {
     const { limits, pricing, onUnknownModel = "throw", defaultOutputTokens = 1024, onSpend, now = Date.now } = options;
+    for (const [name, value] of Object.entries(limits)) {
+        if (value !== undefined && (typeof value !== "number" || Number.isNaN(value) || value < 0)) {
+            throw new RangeError(`Limit "${name}" must be a non-negative number`);
+        }
+    }
+    if (typeof defaultOutputTokens !== "number" || !Number.isFinite(defaultOutputTokens) || defaultOutputTokens < 0) {
+        throw new RangeError("defaultOutputTokens must be a non-negative finite number");
+    }
     const store = options.store ?? memoryStore();
     let runs = 0;
     function slots(scope) {
@@ -113,7 +134,15 @@ export function createSpendCap(options) {
         const list = slots(scope);
         const held = [];
         for (const slot of list) {
-            const total = await store.add(slot.key, amount, slot.ttl);
+            let total;
+            try {
+                total = await store.add(slot.key, amount, slot.ttl);
+            }
+            catch (error) {
+                if (held.length > 0)
+                    await adjust(held, -amount).catch(noop);
+                throw error;
+            }
             held.push(slot);
             if (total > slot.budget) {
                 await adjust(held, -amount);
@@ -159,7 +188,7 @@ export function createSpendCap(options) {
         };
     }
     function request(adapter, params) {
-        const { model } = params;
+        const model = params?.model;
         if (typeof model !== "string")
             throw new TypeError("spendcap needs a model name on every request");
         const maxOutputTokens = adapter.maxOutput(params);
@@ -181,8 +210,11 @@ export function createSpendCap(options) {
                                 const step = await inner.next();
                                 if (step.done)
                                     await finish();
-                                else
-                                    seen = { ...seen, ...adapter.event(step.value) };
+                                else {
+                                    const part = adapter.event(step.value);
+                                    if (part && Object.keys(part).length > 0)
+                                        seen = { ...seen, ...part };
+                                }
                                 return step;
                             }
                             catch (error) {
@@ -221,11 +253,22 @@ export function createSpendCap(options) {
     }
     /** Stream helpers return at once, but the hold takes a moment, so calls wait for it behind a stand-in. */
     function helper(adapter, call, args, scope) {
-        const started = open(request(adapter, args[0]), scope, adapter.provider).then((held) => {
-            const stream = call(...args);
+        let settling;
+        const started = open(request(adapter, args[0]), scope, adapter.provider).then(async (held) => {
+            let stream;
+            try {
+                stream = call(...args);
+            }
+            catch (error) {
+                await held.release();
+                throw error;
+            }
             const settle = (message) => {
+                if (settling)
+                    return;
                 const usage = adapter.usage(message);
-                void held.commit(usage ? complete(usage) : undefined);
+                settling = held.commit(usage ? complete(usage) : undefined);
+                settling.catch(noop);
             };
             stream.on("finalMessage", settle);
             stream.on("error", () => settle());
@@ -239,7 +282,12 @@ export function createSpendCap(options) {
                     return undefined;
                 if (key === Symbol.asyncIterator) {
                     return async function* () {
-                        yield* await started;
+                        try {
+                            yield* await started;
+                        }
+                        finally {
+                            await settling;
+                        }
                     };
                 }
                 if (key === "on" || key === "once") {
@@ -251,7 +299,14 @@ export function createSpendCap(options) {
                         return standIn;
                     };
                 }
-                return (...rest) => started.then((stream) => stream[key](...rest));
+                return (...rest) => started.then(async (stream) => {
+                    try {
+                        return await stream[key](...rest);
+                    }
+                    finally {
+                        await settling;
+                    }
+                });
             },
         });
         return standIn;
